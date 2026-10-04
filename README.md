@@ -53,17 +53,18 @@ Nostr readiness, policies, descriptions, candidates and recovery use authenticat
 
 **Healthy WebRTC continues during API, Redis or Nostr outages**, including after authorization retirement. Established connections do not poll the backend or refresh TURN on a timer. Recovery may need new credentials; if authorization has expired, create a new pair. Failed transfers can resume within the same open page, but text without a delivery receipt has uncertain delivery and is not automatically resent.
 
-Discovery has its own unavailable state and does not disable QR/link pairing. Presence expires after 45 seconds; connection requests expire after 60 seconds and require explicit acceptance. Only Vercel's overwritten client-IP header is trusted in production; unsupported hosts have discovery disabled.
+Discovery has its own unavailable state and does not disable QR/link pairing. Presence expires after 45 seconds; connection requests expire after 60 seconds and require explicit acceptance. Both browsers must enable discovery. Incoming requests open an in-app dialog; the sender can cancel, and simultaneous opposite requests resolve to a single handshake. Discovery polls about every two seconds and checks immediately when a page returns to the foreground. In local development, browsers at the same origin share a discovery group. Only Vercel's overwritten client-IP header is trusted in production; unsupported hosts have discovery disabled.
 
 ## Checks
 
 ```sh
 pnpm typecheck
 pnpm lint
+pnpm test:discovery
 pnpm build
 ```
 
-Vercel Preview/managed Redis, forced-TURN transfers, physical Safari/iPhone and cross-network validation remain release gates. This repository no longer includes automated tests; lint, typecheck and build do not verify runtime behavior.
+Vercel Preview/managed Redis, forced-TURN transfers, physical Safari/iPhone and cross-network validation remain release gates. Discovery regression tests cover crossed requests, busy participants, cancellation, decline, expiry, origin isolation and acceptance races. They use an atomic in-memory store; browser and managed Redis validation are still needed for runtime behavior.
 
 ## Privacy boundary
 

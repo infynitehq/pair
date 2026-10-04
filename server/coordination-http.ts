@@ -21,13 +21,11 @@ const operations = new Set([
   "discovery.list",
   "discovery.leave",
   "discovery.request",
+  "discovery.cancel",
   "discovery.accept",
 ])
 export function coordinationStore(env = process.env): CoordinationStore {
-  if (
-    !env.KV_REST_API_URL ||
-    !env.KV_REST_API_TOKEN
-  )
+  if (!env.KV_REST_API_URL || !env.KV_REST_API_TOKEN)
     throw new StoreUnavailable()
   const stage =
     env.VERCEL_ENV ??

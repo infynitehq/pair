@@ -475,7 +475,12 @@ export class CoordinationService {
         for (const [key, value] of Object.entries(group.devices))
           if (value.expiresAt <= now) delete group.devices[key]
         for (const [key, value] of Object.entries(group.requests))
-          if (value.expiresAt <= now) delete group.requests[key]
+          if (
+            value.expiresAt <= now ||
+            (value.accepted === undefined &&
+              (!group.devices[value.from] || !group.devices[value.to]))
+          )
+            delete group.requests[key]
         records.set(groupKey, group)
         if (operation === "discovery.presence") {
           if (
@@ -508,6 +513,13 @@ export class CoordinationService {
         switch (operation) {
           case "discovery.leave":
             delete group.devices[deviceId]
+            for (const [key, request] of Object.entries(group.requests)) {
+              if (
+                request.accepted === undefined &&
+                (request.from === deviceId || request.to === deviceId)
+              )
+                delete group.requests[key]
+            }
             return { left: true }
           case "discovery.list":
             return {
@@ -519,7 +531,21 @@ export class CoordinationService {
                   ([, request]) =>
                     request.to === deviceId && request.accepted === undefined
                 )
-                .map(([id, request]) => ({ id, name: request.name })),
+                .map(([id, request]) => ({
+                  id,
+                  name: request.name,
+                  expiresAt: request.expiresAt,
+                })),
+              outgoing: Object.entries(group.requests)
+                .filter(
+                  ([, request]) =>
+                    request.from === deviceId && request.accepted === undefined
+                )
+                .map(([id, request]) => ({
+                  id,
+                  name: group.devices[request.to]?.name ?? "Other browser",
+                  expiresAt: request.expiresAt,
+                })),
               results: Object.entries(group.requests)
                 .filter(
                   ([, request]) =>
@@ -548,13 +574,32 @@ export class CoordinationService {
                 return fail("CONFLICT", 409)
               return { requestId, expiresAt: existing.expiresAt }
             }
+            // CAS makes the first request authoritative. A simultaneous reverse
+            // request joins that same handshake instead of creating a deadlock.
+            const reverse = Object.entries(group.requests).find(
+              ([, request]) =>
+                request.accepted === undefined &&
+                request.from === target &&
+                request.to === deviceId
+            )
+            if (reverse) {
+              const [id, request] = reverse
+              return {
+                incoming: {
+                  id,
+                  name: request.name,
+                  expiresAt: request.expiresAt,
+                },
+              }
+            }
             if (
               target === deviceId ||
               !group.devices[target] ||
               Object.values(group.requests).some(
                 (request) =>
                   request.accepted === undefined &&
-                  (request.from === deviceId || request.to === target)
+                  ([request.from, request.to].includes(deviceId) ||
+                    [request.from, request.to].includes(target))
               ) ||
               Object.keys(group.requests).length >= 50
             )
@@ -566,6 +611,17 @@ export class CoordinationService {
               expiresAt: now + 60_000,
             }
             return { requestId, expiresAt: now + 60_000 }
+          }
+          case "discovery.cancel": {
+            const requestId = id(input.requestId)
+            const request = group.requests[requestId]
+            if (!request) return { cancelled: true }
+            if (request.from !== deviceId) return fail("UNAUTHORIZED", 401)
+            // Acceptance wins a race with cancellation; retain the invitation
+            // so the sender can complete the existing handshake.
+            if (request.accepted === true) return { cancelled: false }
+            delete group.requests[requestId]
+            return { cancelled: true }
           }
           case "discovery.accept": {
             const request = group.requests[id(input.requestId)]

@@ -780,9 +780,11 @@ export function PairApp() {
                   Both peers approve
                 </span>
               </div>
-              <PairDiscovery session={session} />
             </>
           )}
+
+          {/* Discovery must survive invitation creation to deliver acceptance. */}
+          <PairDiscovery session={session} />
 
           {isBusy && (
             <Card className="mx-auto max-w-xl">
