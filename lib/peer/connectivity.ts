@@ -92,6 +92,7 @@ export function redactedDiagnostics(state: PeerState): string {
       status: state.status,
       mode: state.mode,
       signaling: state.signalingStatus,
+      nostrStatus: state.nostrStatus,
       route: state.route,
       relayAvailable: state.relayAvailable,
       roundTripTimeMs: state.roundTripTimeMs,

@@ -13,7 +13,7 @@ export interface ChatMessage {
   id: string
   text: string
   direction: "incoming" | "outgoing"
-  status: "sent" | "delivered"
+  status: "sent" | "delivered" | "failed"
   timestamp: number
 }
 
@@ -24,6 +24,8 @@ export interface PeerState {
   peerName: string | null
   peerId: string | null
   pairingLink: string | null
+  pairingCode: string | null
+  nostrStatus: import("./nostr-signaling").NostrStatus
   expiresAt: number | null
   verificationCode: string | null
   approved: boolean
@@ -39,6 +41,9 @@ export interface PeerState {
   recoveryAttempt: number
   connectedAt: number | null
   roundTripTimeMs: number | null
+  storageError: string | null
+  filesAvailable: boolean
+  transfers: import("../transfer/manager").TransferView[]
 }
 
 export type ConnectionMode = "automatic" | "direct" | "relay"
@@ -55,9 +60,18 @@ export type FailureCode =
 export interface PairSessionHook extends PeerState {
   ready: boolean
   createPairing: () => Promise<void>
+  enablePairingCode: () => void
+  acceptDiscovery: (
+    requestId: string,
+    deviceId: string,
+    authorization: string
+  ) => Promise<void>
   joinPairing: (link: string) => Promise<void>
   approvePeer: () => void
-  sendMessage: (text: string) => void
+  sendMessage: (text: string) => Promise<void>
+  offerFile: (file: File) => void
+  acceptFile: (id: string) => Promise<void>
+  cancelFile: (id: string) => Promise<void>
   disconnect: () => void
   setDeviceName: (name: string) => void
   setConnectionMode: (mode: ConnectionMode) => void

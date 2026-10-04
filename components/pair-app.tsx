@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useRef, useState, type FormEvent } from "react"
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import { useTheme } from "next-themes"
 import { QRCodeSVG } from "qrcode.react"
 import {
@@ -24,6 +24,12 @@ import {
 } from "lucide-react"
 
 import { usePairSession } from "@/hooks/use-pair-session"
+import { PairFiles } from "@/components/pair-files"
+import { PairLibrary } from "@/components/pair-library"
+import { PairDiscovery } from "@/components/pair-discovery"
+import { resolvePairingCode } from "@/lib/pairing/codes"
+import { PairScanner } from "@/components/pair-scanner"
+import { PairIllustration } from "@/components/pair-illustration"
 import type { PairSessionHook, SessionStatus } from "@/lib/peer/types"
 import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -95,8 +101,8 @@ function ThemeToggle() {
 
 function PeerIdentity({ session }: { session: PairSessionHook }) {
   return (
-    <details className="rounded-lg border text-sm">
-      <summary className="cursor-pointer rounded-lg px-4 py-3 text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">
+    <details className="border-y text-sm">
+      <summary className="cursor-pointer px-3 py-3 text-xs text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">
         View browser identities
       </summary>
       <dl className="space-y-4 px-4 pb-4 text-xs">
@@ -142,7 +148,7 @@ function PairingInvite({ session }: { session: PairSessionHook }) {
       <CardHeader>
         <div className="mb-5 flex items-center justify-between">
           <Badge>
-            <span className="size-1.5 rounded-full bg-foreground" />
+            <span className="size-1.5 rounded-full bg-primary" />
             Invitation open
           </Badge>
           <Expiry expiresAt={session.expiresAt} />
@@ -155,7 +161,7 @@ function PairingInvite({ session }: { session: PairSessionHook }) {
       </CardHeader>
       <CardContent>
         <div className="flex flex-col items-center gap-8 sm:flex-row">
-          <div className="shrink-0 rounded-xl border bg-white p-4">
+          <div className="shrink-0 rounded-lg border bg-white p-4">
             {session.pairingLink ? (
               <QRCodeSVG
                 value={session.pairingLink}
@@ -199,6 +205,31 @@ function PairingInvite({ session }: { session: PairSessionHook }) {
                 ? "Clipboard unavailable. The link is selected—copy it manually."
                 : "Keep this page open. You’ll both approve the connection before sending text."}
             </p>
+            {session.pairingCode ? (
+              <div>
+                <label
+                  htmlFor="pairing-code"
+                  className="text-xs text-muted-foreground"
+                >
+                  One-time pairing code
+                </label>
+                <Input
+                  id="pairing-code"
+                  readOnly
+                  value={`${session.pairingCode.slice(0, 4)}-${session.pairingCode.slice(4)}`}
+                  className="mt-2 font-mono text-lg tracking-widest"
+                />
+              </div>
+            ) : (
+              <Button variant="outline" onClick={session.enablePairingCode}>
+                Enable pairing code
+              </Button>
+            )}
+            <p className="text-xs leading-5 text-muted-foreground">
+              Codes are single-use and expire with this invitation. Enabling a
+              code temporarily shares invitation material with our pairing
+              service. QR/link pairing keeps the secret off signaling.
+            </p>
           </div>
         </div>
         <Separator className="my-6" />
@@ -221,7 +252,7 @@ function Verification({ session }: { session: PairSessionHook }) {
     <Card className="mx-auto max-w-xl">
       <CardHeader>
         <div className="mb-5 flex items-center justify-between">
-          <div className="flex size-11 items-center justify-center rounded-xl border">
+          <div className="flex size-11 items-center justify-center rounded-lg bg-primary/7 text-primary">
             <Fingerprint className="size-5" />
           </div>
           <Expiry expiresAt={session.expiresAt} />
@@ -236,9 +267,9 @@ function Verification({ session }: { session: PairSessionHook }) {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-5">
-        <div className="rounded-xl border bg-muted/40 px-4 py-6 text-center">
+        <div className="rounded-lg border bg-muted/40 px-4 py-6 text-center">
           <p className="mb-3 text-xs text-muted-foreground">Connection check</p>
-          <p className="font-mono text-3xl font-medium tracking-[0.15em] break-all sm:text-4xl">
+          <p className="font-mono text-3xl font-medium tracking-[0.15em] break-all text-primary sm:text-4xl">
             {session.verificationCode || "Preparing…"}
           </p>
           <p className="mt-3 text-xs leading-relaxed text-muted-foreground">
@@ -299,15 +330,17 @@ function Chat({ session }: { session: PairSessionHook }) {
   const recovering = session.status === "recovering"
   const [draft, setDraft] = useState("")
   const [sendError, setSendError] = useState("")
+  const [sending, setSending] = useState(false)
   const bottom = useRef<HTMLDivElement>(null)
   useEffect(() => {
     bottom.current?.scrollIntoView({ block: "nearest" })
   }, [session.messages.length])
-  function send(event: FormEvent) {
+  async function send(event: FormEvent) {
     event.preventDefault()
-    if (!draft.trim() || recovering) return
+    if (!draft.trim() || recovering || sending) return
+    setSending(true)
     try {
-      session.sendMessage(draft.trim())
+      await session.sendMessage(draft.trim())
       setDraft("")
       setSendError("")
     } catch (error) {
@@ -316,13 +349,15 @@ function Chat({ session }: { session: PairSessionHook }) {
           ? error.message
           : "Couldn’t send. Check the connection and try again."
       )
+    } finally {
+      setSending(false)
     }
   }
   return (
     <Card className="overflow-hidden">
       <div className="flex flex-wrap items-center justify-between gap-4 border-b px-5 py-4 sm:px-7">
         <div className="flex min-w-0 items-center gap-3">
-          <div className="flex size-10 shrink-0 items-center justify-center rounded-full bg-muted">
+          <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-primary/7 text-primary">
             <Link2 className="size-4" />
           </div>
           <div className="min-w-0">
@@ -370,7 +405,7 @@ function Chat({ session }: { session: PairSessionHook }) {
       >
         {session.messages.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center text-center">
-            <div className="mb-4 flex size-12 items-center justify-center rounded-2xl border">
+            <div className="mb-4 flex size-12 items-center justify-center rounded-lg bg-muted/60 text-muted-foreground">
               <MessageSquare className="size-5" />
             </div>
             <p className="text-sm font-medium">You’re paired. Say something.</p>
@@ -390,9 +425,9 @@ function Chat({ session }: { session: PairSessionHook }) {
             >
               <p
                 className={cn(
-                  "max-w-[90%] rounded-2xl rounded-tl-sm bg-muted px-4 py-3 text-sm leading-relaxed [overflow-wrap:anywhere] whitespace-pre-wrap sm:max-w-[80%]",
+                  "max-w-[90%] rounded-lg rounded-tl-none bg-muted px-4 py-3 text-sm leading-relaxed [overflow-wrap:anywhere] whitespace-pre-wrap sm:max-w-[80%]",
                   message.direction === "outgoing" &&
-                    "rounded-tl-2xl rounded-tr-sm bg-primary text-primary-foreground"
+                    "rounded-tl-lg rounded-tr-none bg-foreground text-background"
                 )}
               >
                 {message.text}
@@ -419,7 +454,11 @@ function Chat({ session }: { session: PairSessionHook }) {
                       <Check className="size-3" />
                     )}
                     <span>
-                      {message.status === "delivered" ? "Delivered" : "Sent"}
+                      {message.status === "delivered"
+                        ? "Delivered"
+                        : message.status === "failed"
+                          ? "Not sent · saved locally"
+                          : "Sent"}
                     </span>
                   </>
                 )}
@@ -456,12 +495,12 @@ function Chat({ session }: { session: PairSessionHook }) {
           <p className="text-xs text-muted-foreground">
             {draft.length > 3500
               ? `${draft.length.toLocaleString()} / 4,000 characters`
-              : "Text first. Files next."}
+              : "Saved only on your devices."}
           </p>
           <Button
             type="submit"
             className="h-10 px-4"
-            disabled={recovering || !draft.trim()}
+            disabled={recovering || sending || !draft.trim()}
           >
             <Send />
             Send text
@@ -473,6 +512,12 @@ function Chat({ session }: { session: PairSessionHook }) {
           </p>
         )}
       </form>
+      <PairFiles session={session} />
+      {session.storageError && (
+        <p role="alert" className="border-t p-4 text-sm text-destructive">
+          {session.storageError}
+        </p>
+      )}
       <div className="space-y-3 border-t px-4 py-3 sm:px-5">
         <ConnectionDetails session={session} />
         <PeerIdentity session={session} />
@@ -484,7 +529,19 @@ function Chat({ session }: { session: PairSessionHook }) {
 export function PairApp() {
   const session = usePairSession()
   const [joinLink, setJoinLink] = useState("")
+  const [joining, setJoining] = useState(false)
   const [actionError, setActionError] = useState("")
+  const joinPairing = session.joinPairing
+  const scan = useCallback(
+    (link: string) => {
+      void joinPairing(link).catch((error) =>
+        setActionError(
+          error instanceof Error ? error.message : "Invalid QR invitation"
+        )
+      )
+    },
+    [joinPairing]
+  )
   const isIdle = session.status === "idle"
   const hasChat =
     session.status === "connected" || session.status === "recovering"
@@ -503,25 +560,42 @@ export function PairApp() {
       )
     }
   }
-  function join(event: FormEvent) {
+  async function join(event: FormEvent) {
     event.preventDefault()
-    if (joinLink.trim()) void run(() => session.joinPairing(joinLink.trim()))
+    if (!joinLink.trim() || joining) return
+    setJoining(true)
+    await run(async () => {
+      const input = joinLink.trim()
+      const link = /^https?:\/\//i.test(input)
+        ? input
+        : await resolvePairingCode(input)
+      await session.joinPairing(link)
+    })
+    setJoining(false)
   }
   return (
     <div className="pair-background min-h-svh">
-      <div className="mx-auto flex min-h-svh max-w-[1000px] flex-col px-5 sm:px-8">
-        <header className="flex h-24 shrink-0 items-center justify-between gap-4 border-b sm:h-28">
-          <div className="flex items-center gap-2.5" aria-label="pair">
-            <span className="flex size-9 items-center justify-center rounded-xl bg-foreground text-background">
-              <Link2 className="size-5 -rotate-45" strokeWidth={2} />
+      <a
+        href="#main"
+        className="sr-only focus:not-sr-only focus:absolute focus:z-10 focus:bg-card focus:p-4"
+      >
+        Skip to content
+      </a>
+      <div className="mx-auto flex min-h-svh max-w-[680px] flex-col px-5 sm:px-8">
+        <header className="flex h-20 shrink-0 items-center justify-between gap-4">
+          <div className="flex items-center gap-2.5">
+            <span className="flex size-8 items-center justify-center text-primary">
+              <Link2
+                className="size-5 -rotate-45"
+                strokeWidth={1.75}
+                aria-hidden="true"
+              />
             </span>
-            <span className="pb-1 text-3xl font-semibold tracking-[-0.08em]">
-              pair
-            </span>
+            <span className="text-lg font-medium tracking-tight">Pair</span>
           </div>
           <div className="flex items-center gap-2 sm:gap-4">
             <Badge
-              className="border-transparent bg-muted/70 text-muted-foreground"
+              className="border-transparent bg-transparent text-[10px] font-normal text-muted-foreground"
               aria-live="polite"
             >
               {isBusy || (!session.ready && isIdle) ? (
@@ -530,7 +604,7 @@ export function PairApp() {
                 <span
                   className={cn(
                     "size-1.5 rounded-full bg-muted-foreground/50",
-                    session.status === "connected" && "bg-foreground"
+                    session.status === "connected" && "bg-primary"
                   )}
                 />
               )}
@@ -542,35 +616,26 @@ export function PairApp() {
           </div>
         </header>
 
-        <main id="main" className="flex-1 py-12 sm:py-16">
-          <div className={cn("mb-10 sm:mb-12", hasChat && "mb-7 sm:mb-8")}>
-            <p className="mb-5 flex items-center gap-2 font-mono text-[10px] tracking-[0.18em] text-muted-foreground uppercase">
-              <span className="h-px w-6 bg-muted-foreground/50" />A direct line
-              between browsers
-            </p>
-            <h1 className="max-w-2xl text-[clamp(2.5rem,6vw,4rem)] leading-[1.06] font-medium tracking-[-0.055em]">
-              {hasChat ? (
-                <>
-                  Less distance.
-                  <br />
-                  <span className="text-muted-foreground">
-                    More connection.
-                  </span>
-                </>
-              ) : (
-                <>
-                  Two browsers.
-                  <br />
-                  <span className="text-muted-foreground">
-                    One little connection.
-                  </span>
-                </>
-              )}
-            </h1>
-            <p className="mt-5 max-w-md text-sm leading-7 text-muted-foreground sm:text-base">
+        <main id="main" className="pair-enter flex-1 pt-5 pb-8 sm:pt-8">
+          <div className={cn("mb-8 text-center", hasChat && "mb-6")}>
+            {isIdle && <PairIllustration />}
+            <h1 className="text-2xl leading-tight font-medium tracking-tight sm:text-3xl">
               {hasChat
-                ? "A shared space for the text you want to send. Just you and your peer."
-                : "Share text from here to there. No account, no inbox, just a temporary connection with someone you choose."}
+                ? "A little closer."
+                : session.status === "waiting"
+                  ? "An invitation to connect."
+                  : session.status === "verifying"
+                    ? "Make sure it’s a match."
+                    : session.status === "closed" || session.status === "error"
+                      ? "A fresh start."
+                      : "From here to there."}
+            </h1>
+            <p className="mx-auto mt-3 max-w-xs text-sm leading-6 text-muted-foreground">
+              {hasChat
+                ? "Text, files, and a little less friction. Saved only on your devices."
+                : isIdle
+                  ? "A little space to share text and files. Two browsers, no account. Just a connection."
+                  : "A direct line between browsers. Keep both pages open while you pair."}
             </p>
           </div>
 
@@ -599,35 +664,42 @@ export function PairApp() {
 
           {isIdle && (
             <>
-              <div className="mb-6 flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
-                <label
-                  htmlFor="device-name"
-                  className="shrink-0 text-xs text-muted-foreground"
-                >
-                  You’ll appear as
-                </label>
-                <Input
-                  id="device-name"
-                  autoComplete="off"
-                  maxLength={40}
-                  key={session.ready ? "ready" : "initializing"}
-                  defaultValue={session.deviceName}
-                  onBlur={(event) => {
-                    const name = event.target.value.trim() || "This device"
-                    event.target.value = name
-                    session.setDeviceName(name)
-                  }}
-                  disabled={!session.ready}
-                  placeholder="Name this browser"
-                  className="h-9 sm:max-w-56"
-                />
-              </div>
-              <ConnectionModeSelect session={session} />
-              <div className="grid gap-5 md:grid-cols-2">
+              <details className="mb-5 border-y">
+                <summary className="cursor-pointer py-3 text-xs text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                  Browser & connection preferences
+                </summary>
+                <div className="pt-2 pb-4">
+                  <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
+                    <label
+                      htmlFor="device-name"
+                      className="shrink-0 text-xs text-muted-foreground"
+                    >
+                      You’ll appear as
+                    </label>
+                    <Input
+                      id="device-name"
+                      autoComplete="off"
+                      maxLength={40}
+                      key={session.ready ? "ready" : "initializing"}
+                      defaultValue={session.deviceName}
+                      onBlur={(event) => {
+                        const name = event.target.value.trim() || "This device"
+                        event.target.value = name
+                        session.setDeviceName(name)
+                      }}
+                      disabled={!session.ready}
+                      placeholder="Name this browser"
+                      className="h-9 sm:max-w-56"
+                    />
+                  </div>
+                  <ConnectionModeSelect session={session} />
+                </div>
+              </details>
+              <div className="grid gap-4 sm:grid-cols-2">
                 <Card className="flex flex-col">
                   <CardHeader>
-                    <div className="mb-7 flex size-10 items-center justify-center rounded-xl border bg-muted/40">
-                      <Plus className="size-5" />
+                    <div className="mb-4 flex size-9 items-center justify-center rounded-lg bg-primary/7 text-primary">
+                      <Plus className="size-4" />
                     </div>
                     <CardTitle>Start a pair</CardTitle>
                     <CardDescription>
@@ -635,7 +707,7 @@ export function PairApp() {
                       or someone you trust.
                     </CardDescription>
                   </CardHeader>
-                  <CardContent className="mt-auto pt-7">
+                  <CardContent className="mt-auto pt-5">
                     <Button
                       className="h-11 w-full justify-between px-4"
                       disabled={!session.ready}
@@ -653,32 +725,32 @@ export function PairApp() {
                       )}
                     </Button>
                     <p className="mt-3 text-xs text-muted-foreground">
-                      A QR code and a link. That’s all it takes.
+                      One invitation. One trusted peer.
                     </p>
                   </CardContent>
                 </Card>
-                <Card className="flex flex-col bg-card/70">
+                <Card className="flex flex-col">
                   <CardHeader>
-                    <div className="mb-7 flex size-10 items-center justify-center rounded-xl border bg-muted/40">
-                      <ArrowDownLeft className="size-5" />
+                    <div className="mb-4 flex size-9 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+                      <ArrowDownLeft className="size-4" />
                     </div>
-                    <CardTitle>Have a link?</CardTitle>
+                    <CardTitle>Have a link or code?</CardTitle>
                     <CardDescription>
-                      Someone started a pair for you. Paste their invitation
-                      below to join them.
+                      Someone started a pair for you. Paste their invitation or
+                      eight-character code below to join them.
                     </CardDescription>
                   </CardHeader>
-                  <CardContent className="mt-auto pt-7">
+                  <CardContent className="mt-auto pt-5">
                     <form onSubmit={join} className="space-y-3">
                       <label htmlFor="join-link" className="sr-only">
                         Pairing invitation link
                       </label>
                       <Input
                         id="join-link"
-                        type="url"
+                        type="text"
                         value={joinLink}
                         onChange={(event) => setJoinLink(event.target.value)}
-                        placeholder="Paste a pairing link…"
+                        placeholder="Pairing link or ABCD-EFGH…"
                         autoComplete="off"
                         spellCheck={false}
                         required
@@ -688,16 +760,17 @@ export function PairApp() {
                         type="submit"
                         variant="outline"
                         className="h-11 w-full justify-between px-4"
-                        disabled={!session.ready || !joinLink.trim()}
+                        disabled={!session.ready || joining || !joinLink.trim()}
                       >
                         <span>Join a pair</span>
                         <ArrowRight />
                       </Button>
                     </form>
+                    {session.ready && <PairScanner onScan={scan} />}
                   </CardContent>
                 </Card>
               </div>
-              <div className="mt-8 flex flex-wrap items-center gap-x-6 gap-y-3 text-xs text-muted-foreground">
+              <div className="mt-5 flex flex-wrap justify-center gap-x-5 gap-y-3 text-[11px] text-muted-foreground">
                 <span className="flex items-center gap-2">
                   <LockKeyhole className="size-3.5" />
                   Encrypted in transit
@@ -706,8 +779,8 @@ export function PairApp() {
                   <ShieldCheck className="size-3.5" />
                   Both peers approve
                 </span>
-                <span className="md:ml-auto">Text first. Files next.</span>
               </div>
+              <PairDiscovery session={session} />
             </>
           )}
 
@@ -744,7 +817,7 @@ export function PairApp() {
           {(session.status === "closed" || session.status === "error") && (
             <Card className="mx-auto max-w-xl">
               <CardContent className="py-10 text-center sm:py-12">
-                <div className="mx-auto mb-5 flex size-12 items-center justify-center rounded-2xl border">
+                <div className="mx-auto mb-5 flex size-12 items-center justify-center rounded-lg bg-muted">
                   <Link2 className="size-5" />
                 </div>
                 <h2 className="text-xl font-medium tracking-tight">
@@ -769,20 +842,27 @@ export function PairApp() {
               </CardContent>
             </Card>
           )}
+          <PairLibrary />
         </main>
 
-        <footer className="flex flex-col justify-between gap-4 border-t py-6 sm:flex-row sm:items-start sm:gap-10">
-          <p className="flex shrink-0 items-center gap-2 text-xs font-medium">
-            <Link2 className="size-3.5" />
+        <footer className="border-t py-5 text-center">
+          <p className="text-[11px] text-muted-foreground">
             Small connection. Less friction.
           </p>
-          <p className="max-w-lg text-xs leading-5 text-muted-foreground">
-            Text travels over encrypted WebRTC, directly or through a TURN
-            relay. Signaling handles connection metadata, including network
-            addresses and timing, not your text. A relay can see network
-            addresses, traffic volume, and timing, but not plaintext messages.
-            Keep both pages open; history stays in memory.
-          </p>
+          <details className="mx-auto mt-3 max-w-md text-left">
+            <summary className="cursor-pointer text-center text-[10px] text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              How Pair handles your data
+            </summary>
+            <p className="mt-3 text-xs leading-6 text-muted-foreground">
+              Text travels over encrypted WebRTC, directly or through a TURN
+              relay. Signaling handles connection metadata, including network
+              addresses and timing, not your text. A relay can see network
+              addresses, traffic volume, and timing, but not plaintext messages.
+              Keep both pages open to transfer. Messages and accepted files are
+              stored in this browser until you delete them or site storage is
+              cleared.
+            </p>
+          </details>
         </footer>
       </div>
     </div>

@@ -58,22 +58,8 @@ export function createIceProvider(
   const stunUrls = urls(env.STUN_URLS, "STUN")
   const turnUrls = urls(env.TURN_URLS, "TURN")
   const secret = env.TURN_SHARED_SECRET ?? ""
-  const ttlValue = env.TURN_CREDENTIAL_TTL_SECONDS?.trim() || "600"
-  const ttl = Number(ttlValue)
-  if (
-    !/^\d+$/.test(ttlValue) ||
-    !Number.isInteger(ttl) ||
-    ttl < 60 ||
-    ttl > 3600
-  ) {
-    throw new Error(
-      "TURN_CREDENTIAL_TTL_SECONDS must be an integer from 60 to 3600"
-    )
-  }
-  const turnConfigured =
-    turnUrls.length > 0 ||
-    secret.length > 0 ||
-    Boolean(env.TURN_CREDENTIAL_TTL_SECONDS?.trim())
+  const ttl = 600
+  const turnConfigured = turnUrls.length > 0 || secret.length > 0
   if (turnConfigured && (turnUrls.length === 0 || secret.trim().length < 32)) {
     throw new Error(
       "TURN requires TURN_URLS and TURN_SHARED_SECRET of at least 32 characters"

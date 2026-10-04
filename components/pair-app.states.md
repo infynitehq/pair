@@ -23,4 +23,4 @@ Expandable connection details show mode, selected route, optional RTT, elapsed s
 
 No file transfer controls are offered. “Text first. Files next.” is roadmap copy only. Privacy copy distinguishes encrypted WebRTC text from signaling/relay metadata visibility.
 
-Dependencies: existing `@base-ui/react` Button, `lucide-react`, `next-themes`, `qrcode.react`, and `cn`. The additional small shadcn-style UI primitives are implemented locally to avoid dependency-manifest changes.
+Dependencies: native HTML buttons, `lucide-react`, `next-themes`, `qrcode.react`, and `cn`. The small UI primitives are implemented locally.

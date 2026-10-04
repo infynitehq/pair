@@ -9,6 +9,7 @@ import type {
   PeerState,
 } from "@/lib/peer/types"
 import { redactedDiagnostics } from "@/lib/peer/connectivity"
+import { content, subscribeContent } from "@/lib/storage/content"
 
 export function usePairSession(): PairSessionHook {
   const [state, setState] = useState<PeerState>(initialState)
@@ -18,13 +19,20 @@ export function usePairSession(): PairSessionHook {
 
   useEffect(() => {
     let cancelled = false
+    let refreshTimer: ReturnType<typeof setTimeout>
+    const unsubscribe = subscribeContent(() => {
+      clearTimeout(refreshTimer)
+      refreshTimer = setTimeout(() => {
+        if (!cancelled) void session.current?.refreshHistory()
+      }, 150)
+    })
     const url = new URL(window.location.href)
     if (url.searchParams.has("pair")) {
       invitation.current = url.toString()
       window.history.replaceState(null, "", "/")
     }
-    loadIdentity()
-      .then((identity) => {
+    Promise.all([loadIdentity(), content.initialize()])
+      .then(([identity]) => {
         if (cancelled) return
         let savedName: string | null = null
         let mode: ConnectionMode = "automatic"
@@ -46,7 +54,8 @@ export function usePairSession(): PairSessionHook {
           identity,
           name.slice(0, 40),
           setState,
-          mode
+          mode,
+          true
         )
         session.current = instance
         setState(instance.state)
@@ -70,6 +79,8 @@ export function usePairSession(): PairSessionHook {
       })
     return () => {
       cancelled = true
+      clearTimeout(refreshTimer)
+      unsubscribe()
       session.current?.dispose()
       session.current = null
     }
@@ -81,11 +92,24 @@ export function usePairSession(): PairSessionHook {
     createPairing: async () => {
       await session.current?.create()
     },
+    enablePairingCode: () => session.current?.enablePairingCode(),
+    acceptDiscovery: async (requestId, deviceId, authorization) => {
+      await session.current?.acceptDiscovery(requestId, deviceId, authorization)
+    },
     joinPairing: async (link) => {
       await session.current?.join(link)
     },
     approvePeer: () => session.current?.approve(),
-    sendMessage: (text) => session.current?.sendText(text),
+    sendMessage: async (text) => {
+      await session.current?.sendText(text)
+    },
+    offerFile: (file) => session.current?.offerFile(file),
+    acceptFile: async (id) => {
+      await session.current?.acceptFile(id)
+    },
+    cancelFile: async (id) => {
+      await session.current?.cancelFile(id)
+    },
     disconnect: () => session.current?.disconnect(),
     setDeviceName: (name) => session.current?.setName(name),
     setConnectionMode: (mode) => session.current?.setMode(mode),

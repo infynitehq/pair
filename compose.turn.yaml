@@ -1,9 +1,0 @@
-# Linux-only loopback fixture. Never deploy this configuration publicly.
-services:
-  turn:
-    image: coturn/coturn:4.6.3
-    profiles: [integration]
-    network_mode: host
-    command: ["-c", "/etc/coturn/turnserver.conf"]
-    volumes:
-      - ./infra/turn/turnserver.conf:/etc/coturn/turnserver.conf:ro

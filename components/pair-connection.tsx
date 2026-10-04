@@ -61,7 +61,7 @@ export function ConnectionModeSelect({
   session: PairSessionHook
 }) {
   return (
-    <div className="mb-6 space-y-2">
+    <div className="space-y-2">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-4">
         <label
           htmlFor="connection-mode"
@@ -99,7 +99,9 @@ export function ConnectionHealth({ session }: { session: PairSessionHook }) {
   const signalingInterrupted =
     session.signalingStatus === "offline" ||
     session.signalingStatus === "reconnecting" ||
-    session.signalingStatus === "connecting"
+    session.signalingStatus === "connecting" ||
+    (session.signalingStatus !== "retired" &&
+      session.nostrStatus !== "available")
   return (
     <div
       role="status"
@@ -172,8 +174,8 @@ export function ConnectionDetails({ session }: { session: PairSessionHook }) {
     }
   }
   return (
-    <details className="rounded-lg border text-sm">
-      <summary className="cursor-pointer rounded-lg px-4 py-3 text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">
+    <details className="border-y text-sm">
+      <summary className="cursor-pointer px-3 py-3 text-xs text-muted-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring">
         Connection details
       </summary>
       <div className="space-y-4 px-4 pb-4">
@@ -200,6 +202,8 @@ export function ConnectionDetails({ session }: { session: PairSessionHook }) {
           </dd>
           <dt className="text-muted-foreground">Signaling</dt>
           <dd className="capitalize">{session.signalingStatus}</dd>
+          <dt className="text-muted-foreground">Negotiation transport</dt>
+          <dd>Nostr · {session.nostrStatus}</dd>
           <dt className="text-muted-foreground">Recovery attempt</dt>
           <dd>{session.recoveryAttempt}</dd>
           <dt className="text-muted-foreground">Relay credentials</dt>

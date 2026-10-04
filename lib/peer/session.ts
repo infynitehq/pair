@@ -18,6 +18,16 @@ import {
   type IceConfiguration,
 } from "./connectivity"
 import type { ConnectionMode, FailureCode, PeerState } from "./types"
+import { content, type Scope } from "../storage/content"
+import { TransferManager } from "../transfer/manager"
+import { nostrRelayUrls } from "./nostr-config"
+import { NostrSignaling } from "./nostr-signaling"
+import {
+  ApiError,
+  coordinationId,
+  coordinationRequest,
+  coordinationToken,
+} from "./coordination-client"
 
 export const initialState: PeerState = {
   status: "idle",
@@ -40,6 +50,11 @@ export const initialState: PeerState = {
   recoveryAttempt: 0,
   connectedAt: null,
   roundTripTimeMs: null,
+  storageError: null,
+  filesAvailable: false,
+  transfers: [],
+  pairingCode: null,
+  nostrStatus: "offline",
 }
 
 export function parsePairingLink(input: string, origin: string) {
@@ -50,7 +65,7 @@ export function parsePairingLink(input: string, origin: string) {
     url.origin !== origin ||
     url.pathname !== "/" ||
     !sessionId ||
-    !/^[A-Za-z0-9_-]{20,100}$/.test(sessionId) ||
+    !/^[a-f0-9]{32}$/.test(sessionId) ||
     !/^[A-Za-z0-9_-]{43}$/.test(secret)
   )
     throw new ConnectionError(
@@ -60,25 +75,8 @@ export function parsePairingLink(input: string, origin: string) {
   return { sessionId, secret }
 }
 
-function signalingUrl() {
-  if (process.env.NEXT_PUBLIC_SIGNALING_URL)
-    return process.env.NEXT_PUBLIC_SIGNALING_URL
-  const url = new URL(window.location.href)
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:"
-  url.port = "3001"
-  url.pathname = "/signal"
-  url.search = ""
-  url.hash = ""
-  return url.toString()
-}
-
 type Transport = SignedDescription["transport"]
 type Candidate = { negotiation: number; candidate: RTCIceCandidateInit }
-type Refresh = {
-  resolve: () => void
-  reject: (error: Error) => void
-  timer: ReturnType<typeof setTimeout>
-}
 const emptyIce: IceConfiguration = {
   iceServers: [],
   relayAvailable: false,
@@ -89,11 +87,14 @@ const tokenValid = (value: unknown): value is string =>
 
 export class PeerSession {
   state: PeerState
-  private socket: WebSocket | null = null
-  private socketGeneration = 0
   private peer: RTCPeerConnection | null = null
   private control: RTCDataChannel | null = null
   private chat: RTCDataChannel | null = null
+  private files: RTCDataChannel | null = null
+  private transferManager: TransferManager | null = null
+  private scope: Promise<Scope> | null = null
+  private applicationQueue = Promise.resolve()
+  private applicationBytes = 0
   private cipher: SignalCipher | null = null
   private role: "host" | "guest" = "host"
   private sessionId = ""
@@ -103,17 +104,6 @@ export class PeerSession {
   private candidates: Candidate[] = []
   private receiveQueue = Promise.resolve()
   private sendQueue = Promise.resolve()
-  private pendingSignals = new Map<number, SealedSignal>()
-  private resumeTokens: string[] = []
-  private resumeRequest: {
-    used: string
-    next: string
-    remaining: string[]
-  } | null = null
-  private reconnectAttempts = 0
-  private activeRoleUntil = 0
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
-  private socketDeadline: ReturnType<typeof setTimeout> | null = null
   private deadline: ReturnType<typeof setTimeout> | null = null
   private recoveryTimer: ReturnType<typeof setTimeout> | null = null
   private statsTimer: ReturnType<typeof setInterval> | null = null
@@ -121,8 +111,6 @@ export class PeerSession {
   private seenMessages = new Set<string>()
   private channelReady = false
   private ice: IceConfiguration = emptyIce
-  private refresh: Refresh | null = null
-  private refreshId = ""
   private negotiation = 0
   private remoteNegotiation = -1
   private transport: Transport = "initial"
@@ -135,18 +123,318 @@ export class PeerSession {
   private remoteMode: ConnectionMode | null = null
   private effectiveMode: ConnectionMode | null = null
   private initializing = false
+  private nostr: NostrSignaling | null = null
+  private nostrStarting: Promise<void> | null = null
+  private nostrUrls: string[]
+  private apiAuthorization = ""
+  private apiAbort: AbortController | null = null
+  private statusPoll: ReturnType<typeof setTimeout> | null = null
+  private statusAbort: AbortController | null = null
+  private authorizationDeadline: ReturnType<typeof setTimeout> | null = null
+  private readyClaimant = ""
+  private admittedClaimant = ""
+  private codeRequest = ""
 
   constructor(
     private identity: DeviceIdentity,
     name: string,
     private onChange: (state: PeerState) => void,
-    mode: ConnectionMode = "automatic"
+    mode: ConnectionMode = "automatic",
+    private durable = false,
+    relays = nostrRelayUrls(
+      process.env.NEXT_PUBLIC_NOSTR_RELAY_URLS ?? "wss://nostr.infynite.in"
+    )
   ) {
     this.state = {
       ...initialState,
       deviceId: identity.deviceId,
       deviceName: name,
       mode,
+    }
+    this.nostrUrls = relays
+  }
+
+  private ensureNostr(generation: number): Promise<void> {
+    this.nostrStarting ??= (async () => {
+      const transport = await NostrSignaling.create({
+        urls: this.nostrUrls,
+        secret: this.secret,
+        sessionId: this.sessionId,
+        role: this.role,
+        receive: (payload) => {
+          this.receiveQueue = this.receiveQueue.then(async () => {
+            if (generation === this.generation)
+              await this.receiveSignal(payload, generation)
+          })
+          return this.receiveQueue
+        },
+        status: (nostrStatus) => {
+          if (generation === this.generation) {
+            this.update({ nostrStatus })
+            if (this.state.signalingStatus !== "retired") {
+              this.update({
+                signalingStatus:
+                  nostrStatus === "available" ? "available" : "reconnecting",
+              })
+              if (
+                nostrStatus === "available" &&
+                this.state.status === "recovering" &&
+                !this.recoveryBusy
+              )
+                this.requestRecovery()
+            }
+          }
+        },
+        failure: (error) => {
+          if (generation === this.generation) {
+            if (this.state.status === "connected")
+              this.update({
+                nostrStatus: "offline",
+                signalingStatus: "reconnecting",
+              })
+            else this.fail(error, "signaling-unavailable")
+          }
+        },
+      })
+      if (generation !== this.generation) {
+        transport.close()
+        await transport.ready().catch(() => {})
+        return
+      }
+      this.nostr = transport
+      await transport.ready()
+    })()
+    return this.nostrStarting
+  }
+
+  private localScope() {
+    if (!this.state.peerId) throw new Error("No approved peer")
+    this.scope ??= content.ensureConversation(
+      this.state.peerId,
+      this.state.peerName ?? "Peer"
+    )
+    return this.scope
+  }
+  private storageFailure(error: unknown) {
+    this.update({
+      storageError:
+        error instanceof Error
+          ? error.message
+          : "Could not save content locally.",
+    })
+  }
+  offerFile(file: File) {
+    if (this.state.status !== "connected" || !this.transferManager)
+      throw new Error("Connect before sending files.")
+    this.transferManager.offer(file)
+  }
+  async acceptFile(id: string) {
+    await this.transferManager?.accept(id)
+  }
+  async cancelFile(id: string) {
+    await this.transferManager?.cancel(id)
+  }
+  enablePairingCode() {
+    if (
+      this.role !== "host" ||
+      this.state.status !== "waiting" ||
+      !this.state.pairingLink
+    )
+      return
+    const generation = this.generation
+    this.codeRequest ||= coordinationToken()
+    void this.api("code.publish", {
+      requestId: this.codeRequest,
+      link: this.state.pairingLink,
+    })
+      .then((result) => {
+        if (generation !== this.generation || this.state.status !== "waiting")
+          return
+        if (
+          typeof result.code !== "string" ||
+          !/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{8}$/.test(result.code)
+        )
+          throw new Error("Invalid pairing code")
+        this.update({ pairingCode: result.code })
+      })
+      .catch(() => {
+        if (generation === this.generation)
+          this.update({
+            error:
+              "Pairing codes unavailable. Use this invitation’s QR code or link.",
+          })
+      })
+  }
+
+  async acceptDiscovery(
+    requestId: string,
+    deviceId: string,
+    authorization: string
+  ) {
+    if (this.role !== "host" || !this.state.pairingLink)
+      throw new Error("Create an invitation first.")
+    const generation = this.generation
+    await coordinationRequest(
+      "discovery.accept",
+      {
+        requestId,
+        deviceId,
+        authorization,
+        accepted: true,
+        sessionId: this.sessionId,
+        hostAuthorization: this.apiAuthorization,
+        link: this.state.pairingLink,
+      },
+      this.apiAbort?.signal
+    ).catch((error) => {
+      if (generation === this.generation)
+        this.update({
+          error:
+            "Discovery invitation could not be delivered. Share this QR code or link instead.",
+        })
+      throw error
+    })
+  }
+
+  private api(
+    operation: string,
+    input: Record<string, unknown> = {},
+    signal?: AbortSignal
+  ) {
+    return coordinationRequest(
+      operation,
+      {
+        sessionId: this.sessionId,
+        role: this.role,
+        authorization: this.apiAuthorization,
+        ...input,
+      },
+      signal && this.apiAbort
+        ? AbortSignal.any([signal, this.apiAbort.signal])
+        : (signal ?? this.apiAbort?.signal)
+    )
+  }
+  private async initializeHttp(
+    type: "created" | "joined",
+    input: Record<string, unknown>,
+    generation: number
+  ) {
+    if (!this.nostrUrls.length)
+      throw new ConnectionError(
+        "signaling-unavailable",
+        "Nostr signaling must be configured. No fallback transport is used."
+      )
+    this.apiAuthorization = coordinationToken()
+    this.apiAbort = new AbortController()
+    const result = await this.api(
+      type === "created" ? "session.create" : "session.join",
+      input
+    )
+    if (generation !== this.generation) return
+    const turn = await this.api("session.turn", {
+      requestId: coordinationToken(),
+    })
+    if (generation !== this.generation) return
+    if (
+      result.sessionId !== this.sessionId ||
+      typeof result.expiresAt !== "number" ||
+      !Number.isFinite(result.expiresAt)
+    )
+      throw new Error("Invalid pairing session")
+    if (!this.cipher) {
+      const cipher = await SignalCipher.create(
+        this.secret,
+        this.sessionId,
+        this.role
+      )
+      if (generation !== this.generation) return
+      this.cipher = cipher
+    }
+    this.useIce(turn.iceConfig)
+    await this.ensureNostr(generation)
+    if (generation !== this.generation) return
+    this.update({ expiresAt: result.expiresAt, signalingStatus: "available" })
+    if (type === "created") {
+      const link = new URL("/", window.location.origin)
+      link.searchParams.set("pair", this.sessionId)
+      link.hash = this.secret
+      this.update({ status: "waiting", pairingLink: link.toString() })
+      this.setDeadline(
+        Math.max(1, Math.min(result.expiresAt - Date.now(), 120_000)),
+        new ConnectionError(
+          "invitation-expired",
+          "This invite expired. Create a new one."
+        )
+      )
+    }
+    const expiresAt = result.authorizationExpiresAt
+    if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt))
+      throw new Error("Invalid authorization lifetime")
+    this.authorizationDeadline = setTimeout(
+      () => this.retireSignaling(),
+      Math.max(1, expiresAt - Date.now())
+    )
+    this.pollStatus(generation)
+    if (type === "joined") {
+      const claimant = encode(
+        await crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode(this.apiAuthorization)
+        )
+      )
+      if (generation !== this.generation) return
+      // Readiness is an ordinary encrypted, ordered, acknowledged frame. Sent exactly once;
+      // Nostr retries the same ciphertext without resetting either sequence counter.
+      this.sendSignal({ kind: "ready", claimant })
+      await this.startPair(generation)
+    }
+  }
+  private pollStatus(generation: number, attempt = 0) {
+    if (
+      generation !== this.generation ||
+      this.everConnected ||
+      ["closed", "error"].includes(this.state.status)
+    )
+      return
+    this.statusPoll = setTimeout(
+      () => {
+        this.statusPoll = null
+        this.statusAbort = new AbortController()
+        void this.api("session.status", {}, this.statusAbort.signal)
+          .then(async (result) => {
+            if (generation !== this.generation || this.everConnected) return
+            if (typeof result.guestClaimant === "string")
+              this.admittedClaimant = result.guestClaimant
+            if (
+              this.role === "host" &&
+              this.readyClaimant &&
+              this.readyClaimant === this.admittedClaimant
+            )
+              await this.startPair(generation)
+            this.pollStatus(generation, 0)
+          })
+          .catch((error) => {
+            if (generation !== this.generation || this.everConnected) return
+            if (
+              error instanceof ApiError &&
+              error.category === "SESSION_EXPIRED"
+            )
+              this.fail(error)
+            else this.pollStatus(generation, attempt + 1)
+          })
+      },
+      Math.min(1000 * 2 ** attempt, 8000)
+    )
+  }
+  async refreshHistory() {
+    if (!this.scope) return
+    const generation = this.generation
+    try {
+      const scope = await this.scope
+      const messages = await content.messages(scope.id, Infinity, 500)
+      if (generation === this.generation) this.update({ messages })
+    } catch (error) {
+      this.storageFailure(error)
     }
   }
 
@@ -189,9 +477,12 @@ export class PeerSession {
     try {
       const { joinVerifier } = await admissionProof(this.secret)
       if (generation !== this.generation) return
-      await this.openSocket()
-      if (generation === this.generation)
-        this.sendSocket({ type: "create", joinVerifier })
+      this.sessionId = coordinationId()
+      await this.initializeHttp(
+        "created",
+        { joinVerifier, createdAt: Date.now() },
+        generation
+      )
     } catch (error) {
       if (generation === this.generation)
         this.fail(error, "signaling-unavailable")
@@ -218,9 +509,7 @@ export class PeerSession {
       ])
       if (generation !== this.generation) return
       this.cipher = cipher
-      await this.openSocket()
-      if (generation === this.generation)
-        this.sendSocket({ type: "join", sessionId: this.sessionId, joinToken })
+      await this.initializeHttp("joined", { joinToken }, generation)
     } catch (error) {
       if (generation === this.generation)
         this.fail(error, "signaling-unavailable")
@@ -234,9 +523,6 @@ export class PeerSession {
     this.guestSdp = ""
     this.candidates = []
     this.seenMessages.clear()
-    this.pendingSignals.clear()
-    this.resumeTokens = []
-    this.resumeRequest = null
     this.channelReady = false
     this.everConnected = false
     this.recoveryBusy = false
@@ -246,13 +532,14 @@ export class PeerSession {
     this.peerReadyNegotiation = -1
     this.readySentNegotiation = -1
     this.deferredChat = []
-    this.reconnectAttempts = 0
     this.ice = emptyIce
-    this.activeRoleUntil = 0
     this.localPolicySent = false
     this.remoteMode = null
     this.effectiveMode = null
     this.initializing = false
+    this.readyClaimant = ""
+    this.admittedClaimant = ""
+    this.codeRequest = ""
     this.sendQueue = Promise.resolve()
     this.receiveQueue = Promise.resolve()
     this.update({
@@ -262,6 +549,7 @@ export class PeerSession {
       deviceName: this.state.deviceName,
       mode: this.state.mode,
       signalingStatus: "connecting",
+      nostrStatus: "connecting",
     })
     this.setDeadline(
       20_000,
@@ -276,183 +564,9 @@ export class PeerSession {
     if (this.deadline) clearTimeout(this.deadline)
     this.deadline = setTimeout(() => this.fail(error), ms)
   }
-  private clearSocketDeadline() {
-    if (this.socketDeadline) clearTimeout(this.socketDeadline)
-    this.socketDeadline = null
-  }
-
-  private openSocket(): Promise<void> {
-    const generation = this.generation
-    const socketGeneration = ++this.socketGeneration
-    return new Promise((resolve, reject) => {
-      const socket = new WebSocket(signalingUrl())
-      this.socket = socket
-      const current = () =>
-        generation === this.generation &&
-        socketGeneration === this.socketGeneration
-      this.clearSocketDeadline()
-      this.socketDeadline = setTimeout(() => {
-        if (current()) socket.close()
-      }, 6_000)
-      socket.onopen = () => {
-        if (current()) {
-          this.clearSocketDeadline()
-          resolve()
-        } else reject(new Error("Session cancelled"))
-      }
-      socket.onerror = () =>
-        reject(
-          new ConnectionError(
-            "signaling-unavailable",
-            "Unable to reach signaling. Check the service URL and network."
-          )
-        )
-      socket.onclose = () => {
-        reject(new Error("Signaling disconnected"))
-        if (!current()) return
-        this.clearSocketDeadline()
-        if (
-          ["closed", "error"].includes(this.state.status) ||
-          this.state.signalingStatus === "retired"
-        )
-          return
-        if (this.recoveryTimer) {
-          clearTimeout(this.recoveryTimer)
-          this.recoveryTimer = null
-        }
-        if (this.refresh) {
-          clearTimeout(this.refresh.timer)
-          this.refresh.timer = setTimeout(() => {
-            this.refresh?.reject(
-              new ConnectionError(
-                "signaling-unavailable",
-                "Relay refresh could not resume."
-              )
-            )
-            this.refresh = null
-          }, 75_000)
-        }
-        if (this.resumeTokens.length) this.scheduleResume()
-        else
-          this.fail(
-            new ConnectionError(
-              "signaling-unavailable",
-              "The pairing connection closed. Create a new invitation."
-            )
-          )
-      }
-      socket.onmessage = (event) => {
-        // Credential refresh may be awaited by negotiation processing. Resolve it
-        // outside the ordered encrypted-signal queue to avoid a self-deadlock.
-        if (
-          current() &&
-          typeof event.data === "string" &&
-          event.data.length <= 65_536
-        ) {
-          try {
-            const message = JSON.parse(event.data)
-            if (
-              message?.v === 2 &&
-              (message.type === "resumed" ||
-                (message.type === "error" && this.resumeRequest) ||
-                (this.refresh &&
-                  message.requestId === this.refreshId &&
-                  (message.type === "ice-config" || message.type === "error")))
-            ) {
-              void this.receiveSignal(message, generation).catch((error) => {
-                if (current()) this.fail(error)
-              })
-              return
-            }
-          } catch {
-            /* Normal validation below handles malformed frames. */
-          }
-        }
-        this.receiveQueue = this.receiveQueue
-          .then(async () => {
-            if (!current()) return
-            if (typeof event.data !== "string" || event.data.length > 65_536)
-              throw new ConnectionError(
-                "protocol-error",
-                "Invalid signaling frame"
-              )
-            await this.receiveSignal(JSON.parse(event.data), generation)
-          })
-          .catch((error) => {
-            if (generation === this.generation) this.fail(error)
-          })
-      }
-    })
-  }
-
-  private sendSocket(value: Record<string, unknown>) {
-    if (this.socket?.readyState !== WebSocket.OPEN)
-      throw new ConnectionError(
-        "signaling-unavailable",
-        "Signaling is unavailable."
-      )
-    this.socket.send(JSON.stringify({ v: 2, ...value }))
-  }
-
-  private scheduleResume() {
-    if (this.reconnectTimer || this.state.signalingStatus === "retired") return
-    if (
-      (this.activeRoleUntil && Date.now() >= this.activeRoleUntil) ||
-      (!this.activeRoleUntil && this.reconnectAttempts >= 5)
-    ) {
-      this.retireSignaling()
-      return
-    }
-    this.update({ signalingStatus: "reconnecting" })
-    const delay =
-      (this.activeRoleUntil
-        ? 3_000
-        : Math.min(400 * 2 ** this.reconnectAttempts++, 5_000)) +
-      Math.random() * 200
-    const generation = this.generation
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null
-      void this.openSocket()
-        .then(() => {
-          if (generation !== this.generation) return
-          this.requestResume([...this.resumeTokens])
-        })
-        .catch(() => {
-          if (generation === this.generation) this.scheduleResume()
-        })
-    }, delay)
-  }
-
-  private requestResume(tokens: string[]) {
-    const used = tokens.shift()
-    if (!used) {
-      this.retireSignaling()
-      return
-    }
-    const next = encode(crypto.getRandomValues(new Uint8Array(32)))
-    this.resumeRequest = { used, next, remaining: tokens }
-    // Retain both possibilities until the rotation is acknowledged. A lost response
-    // can mean either the previous token or the proposed token is current server-side.
-    this.resumeTokens = [next, used, ...tokens].slice(0, 8)
-    this.sendSocket({
-      type: "resume",
-      sessionId: this.sessionId,
-      role: this.role,
-      resumeToken: used,
-      nextResumeToken: next,
-    })
-    this.clearSocketDeadline()
-    this.socketDeadline = setTimeout(() => this.socket?.close(), 6_000)
-  }
-
   private retireSignaling() {
-    this.clearSocketDeadline()
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
-    this.reconnectTimer = null
-    this.resumeTokens = []
-    this.resumeRequest = null
     this.update({ signalingStatus: "retired" })
-    this.socket?.close()
+    this.nostr?.close()
     if (!this.everConnected || this.state.status === "recovering")
       this.fail(
         new ConnectionError(
@@ -467,19 +581,10 @@ export class PeerSession {
     this.sendQueue = this.sendQueue
       .then(async () => {
         if (generation !== this.generation || !this.cipher) return
-        if (this.pendingSignals.size >= 128)
-          throw new ConnectionError(
-            "signaling-unavailable",
-            "The signaling queue is full. Pair again."
-          )
         const payload = await this.cipher.seal(value)
         if (generation !== this.generation) return
-        this.pendingSignals.set(payload.seq, payload)
-        if (
-          this.state.signalingStatus === "available" &&
-          this.socket?.readyState === WebSocket.OPEN
-        )
-          this.sendSocket({ type: "signal", payload })
+        await this.ensureNostr(generation)
+        if (generation === this.generation) this.nostr!.send(payload)
       })
       .catch((error) => {
         if (generation === this.generation) this.fail(error)
@@ -493,241 +598,22 @@ export class PeerSession {
     rtcConfiguration(this.ice, this.connectionMode())
   }
 
-  private async receiveSignal(
-    message: Record<string, unknown>,
-    generation: number
-  ) {
-    if (!message || message.v !== 2)
+  private async receiveSignal(payload: SealedSignal, generation: number) {
+    if (!this.cipher) throw new Error("Unexpected signaling data")
+    if (!payload || !Number.isSafeInteger(payload.seq) || payload.seq < 0)
+      throw new Error("Invalid signal sequence")
+    if (payload.seq < this.cipher.receivedCount) return
+    let value: unknown
+    try {
+      value = await this.cipher.open(payload)
+    } catch {
       throw new ConnectionError(
-        "protocol-error",
-        "This peer uses an incompatible protocol. Reload both browsers."
+        "authentication-failed",
+        "The pairing secret or encrypted signaling could not be verified."
       )
-    switch (message.type) {
-      case "created": {
-        if (
-          this.role !== "host" ||
-          this.sessionId ||
-          typeof message.sessionId !== "string" ||
-          !/^[A-Za-z0-9_-]{20,100}$/.test(message.sessionId) ||
-          typeof message.expiresAt !== "number" ||
-          !tokenValid(message.resumeToken)
-        )
-          throw new Error("Invalid pairing session")
-        this.sessionId = message.sessionId
-        const cipher = await SignalCipher.create(
-          this.secret,
-          this.sessionId,
-          this.role
-        )
-        if (generation !== this.generation) return
-        this.cipher = cipher
-        this.resumeTokens = [message.resumeToken]
-        this.useIce(message.iceConfig)
-        const link = new URL("/", window.location.origin)
-        link.searchParams.set("pair", this.sessionId)
-        link.hash = this.secret
-        this.update({
-          status: "waiting",
-          signalingStatus: "available",
-          pairingLink: link.toString(),
-          expiresAt: message.expiresAt,
-        })
-        this.setDeadline(
-          Math.max(1, Math.min(message.expiresAt - Date.now(), 120_000)),
-          new ConnectionError(
-            "invitation-expired",
-            "This invite expired. Create a new one."
-          )
-        )
-        break
-      }
-      case "joined":
-        if (
-          this.role !== "guest" ||
-          message.sessionId !== this.sessionId ||
-          typeof message.expiresAt !== "number" ||
-          !tokenValid(message.resumeToken)
-        )
-          throw new Error("Invalid joined session")
-        this.resumeTokens = [message.resumeToken]
-        this.useIce(message.iceConfig)
-        this.update({
-          expiresAt: message.expiresAt,
-          signalingStatus: "available",
-        })
-        break
-      case "resumed":
-        if (
-          !this.resumeRequest ||
-          message.sessionId !== this.sessionId ||
-          message.role !== this.role
-        )
-          throw new Error("Invalid resume response")
-        this.resumeTokens = [this.resumeRequest.next]
-        this.resumeRequest = null
-        this.reconnectAttempts = 0
-        this.activeRoleUntil = 0
-        this.clearSocketDeadline()
-        this.useIce(message.iceConfig)
-        this.update({ signalingStatus: "available" })
-        if (this.refresh) {
-          clearTimeout(this.refresh.timer)
-          this.refresh.resolve()
-          this.refresh = null
-        }
-        for (const payload of this.pendingSignals.values())
-          this.sendSocket({ type: "signal", payload })
-        if (this.everConnected) this.sendSocket({ type: "established" })
-        if (
-          !this.peer &&
-          (message.peerOnline === true || this.role === "guest")
-        )
-          await this.startPair(generation)
-        if (this.state.status === "recovering" && !this.recoveryBusy)
-          this.requestRecovery()
-        else if (this.state.status === "recovering") this.armRecoveryTimeout()
-        break
-      case "peer-ready":
-        await this.startPair(generation)
-        break
-      case "signal": {
-        if (!this.cipher) throw new Error("Unexpected signaling data")
-        const payload = message.payload as SealedSignal
-        if (!payload || !Number.isSafeInteger(payload.seq) || payload.seq < 0)
-          throw new Error("Invalid signal sequence")
-        if (payload.seq < this.cipher.receivedCount) {
-          this.sendSocket({
-            type: "signal-received",
-            seq: this.cipher.receivedCount - 1,
-          })
-          break
-        }
-        let value: unknown
-        try {
-          value = await this.cipher.open(payload)
-        } catch {
-          throw new ConnectionError(
-            "authentication-failed",
-            "The pairing secret or encrypted signaling could not be verified."
-          )
-        }
-        if (generation !== this.generation) return
-        await this.receivePayload(value, generation)
-        if (
-          generation === this.generation &&
-          this.socket?.readyState === WebSocket.OPEN
-        )
-          this.sendSocket({ type: "signal-received", seq: payload.seq })
-        break
-      }
-      case "signal-ack":
-        if (Number.isSafeInteger(message.seq))
-          this.pendingSignals.delete(message.seq as number)
-        break
-      case "ice-config":
-        if (message.requestId !== this.refreshId || !this.refresh) return
-        this.useIce(message)
-        clearTimeout(this.refresh.timer)
-        this.refresh.resolve()
-        this.refresh = null
-        break
-      case "peer-offline":
-        break // A working data transport is independent of signaling.
-      case "peer-online":
-        if (!this.peer) await this.startPair(generation)
-        if (this.state.status === "recovering" && !this.recoveryBusy)
-          this.requestRecovery()
-        break
-      case "peer-left":
-        if (!this.everConnected || this.state.status === "recovering")
-          this.fail(
-            new ConnectionError(
-              "peer-left",
-              "The other device left. Create a new invite."
-            )
-          )
-        else this.retireSignaling()
-        break
-      case "session-retired":
-        this.retireSignaling()
-        break
-      case "error": {
-        if (message.requestId === this.refreshId && this.refresh) {
-          clearTimeout(this.refresh.timer)
-          this.refresh.reject(
-            new ConnectionError(
-              "relay-unavailable",
-              "Could not refresh temporary relay credentials."
-            )
-          )
-          this.refresh = null
-          return
-        }
-        if (this.resumeRequest) {
-          if (message.code === "ROLE_ACTIVE") {
-            this.resumeTokens = [
-              this.resumeRequest.used,
-              ...this.resumeRequest.remaining,
-            ]
-            this.resumeRequest = null
-            this.activeRoleUntil ||= Date.now() + 65_000
-            if (this.state.status === "recovering")
-              this.setDeadline(
-                Math.max(1, this.activeRoleUntil - Date.now() + 15_000),
-                new ConnectionError(
-                  "signaling-unavailable",
-                  "The previous signaling socket could not be retired. Pair again."
-                )
-              )
-            this.socket?.close()
-            return
-          }
-          if (
-            [
-              "INVALID_RESUME_TOKEN",
-              "INVALID_RESUME",
-              "RESUME_REJECTED",
-              "INVALID_TOKEN",
-              "UNAUTHORIZED",
-            ].includes(String(message.code))
-          ) {
-            this.requestResume(this.resumeRequest.remaining)
-            return
-          }
-          if (
-            ["SESSION_NOT_FOUND", "SESSION_EXPIRED", "RESUME_EXPIRED"].includes(
-              String(message.code)
-            )
-          ) {
-            this.retireSignaling()
-            return
-          }
-          this.socket?.close()
-          return
-        }
-        if (this.everConnected && message.code === "SESSION_EXPIRED") {
-          this.retireSignaling()
-          return
-        }
-        const codes: Record<string, FailureCode> = {
-          SESSION_EXPIRED: "invitation-expired",
-          SESSION_NOT_FOUND: "invitation-expired",
-          INVALID_JOIN_TOKEN: "authentication-failed",
-          INVALID_JOIN: "authentication-failed",
-          INVALID_PROOF: "authentication-failed",
-          JOIN_REJECTED: "authentication-failed",
-          UNAUTHORIZED: "authentication-failed",
-        }
-        throw new ConnectionError(
-          codes[String(message.code)] ?? "signaling-unavailable",
-          typeof message.message === "string"
-            ? message.message.slice(0, 200)
-            : "Pairing failed"
-        )
-      }
-      default:
-        throw new Error("Unknown signaling message")
     }
+    if (generation === this.generation)
+      await this.receivePayload(value, generation)
   }
 
   private routeFailure(): FailureCode {
@@ -742,7 +628,12 @@ export class PeerSession {
   }
 
   private async startPair(generation: number) {
-    if (this.peer) return // A resumed socket can race the initial peer-ready notification.
+    if (
+      this.role === "host" &&
+      (!this.readyClaimant || this.readyClaimant !== this.admittedClaimant)
+    )
+      return
+    if (this.peer) return // Readiness and status polling can race.
     if (!this.cipher) throw new Error("Unexpected peer")
     this.update({ status: "connecting", pairingLink: null })
     this.setDeadline(
@@ -773,9 +664,11 @@ export class PeerSession {
     this.peer = null
     this.control?.close()
     this.chat?.close()
+    this.files?.close()
     old?.close()
     this.control = null
     this.chat = null
+    this.files = null
     this.channelReady = false
   }
 
@@ -819,7 +712,7 @@ export class PeerSession {
       if (
         !current() ||
         this.role !== "guest" ||
-        !["control", "chat"].includes(channel.label)
+        !["control", "chat", "files"].includes(channel.label)
       ) {
         channel.close()
         return
@@ -829,6 +722,8 @@ export class PeerSession {
     if (this.role === "host") {
       this.attachChannel(peer.createDataChannel("control", { ordered: true }))
       this.attachChannel(peer.createDataChannel("chat", { ordered: true }))
+      if (this.durable)
+        this.attachChannel(peer.createDataChannel("files", { ordered: true }))
     }
   }
 
@@ -895,6 +790,16 @@ export class PeerSession {
     if (!input || typeof input !== "object")
       throw new Error("Invalid peer signal")
     const value = input as Record<string, unknown>
+    if (value.kind === "ready") {
+      if (this.role !== "host" || !tokenValid(value.claimant))
+        throw new Error("Invalid admission readiness")
+      if (this.readyClaimant && this.readyClaimant !== value.claimant)
+        throw new Error("Conflicting admission readiness")
+      this.readyClaimant = value.claimant
+      if (this.admittedClaimant === this.readyClaimant && !this.everConnected)
+        await this.startPair(generation)
+      return
+    }
     if (value.kind === "policy") {
       if (
         this.remoteMode !== null ||
@@ -1076,6 +981,21 @@ export class PeerSession {
   }
 
   private attachChannel(channel: RTCDataChannel) {
+    if (channel.label === "files") {
+      if (!this.durable || this.files) {
+        channel.close()
+        return
+      }
+      this.files = channel
+      this.transferManager ??= new TransferManager(
+        () => this.localScope(),
+        (transfers, filesAvailable) =>
+          this.update({ transfers, filesAvailable }),
+        (message) => this.storageFailure(new Error(message))
+      )
+      this.transferManager.attach(channel)
+      return
+    }
     if (channel.label === "control") {
       if (this.control) {
         channel.close()
@@ -1227,9 +1147,42 @@ export class PeerSession {
       expiresAt: null,
       connectedAt: Date.now(),
     })
-    if (this.socket?.readyState === WebSocket.OPEN)
-      this.sendSocket({ type: "established" })
+    if (this.statusPoll) clearTimeout(this.statusPoll)
+    this.statusPoll = null
+    this.statusAbort?.abort()
+    this.statusAbort = null
+    const establishedGeneration = this.generation
+    void this.api("session.established").catch(() => {
+      if (establishedGeneration === this.generation)
+        this.update({
+          error:
+            "Peer connection is active, but recovery authorization could not be recorded.",
+        })
+    })
     this.secret = ""
+    if (this.durable) {
+      const generation = this.generation
+      void this.localScope()
+        .then((scope) => content.messages(scope.id, Infinity, 500))
+        .then((messages) => {
+          if (generation !== this.generation) return
+          const merged = new Map<string, PeerState["messages"][number]>(
+            messages.map((message) => [
+              `${message.direction}:${message.id}`,
+              message,
+            ])
+          )
+          for (const message of this.state.messages)
+            merged.set(`${message.direction}:${message.id}`, message)
+          this.update({
+            messages: Array.from(merged.values())
+              .sort((a, b) => a.timestamp - b.timestamp)
+              .slice(-500),
+          })
+        })
+        .catch((error) => this.storageFailure(error))
+    }
+    this.transferManager?.activate(true)
   }
 
   retryConnection() {
@@ -1244,6 +1197,7 @@ export class PeerSession {
   private enterRecovery() {
     if (this.state.status === "recovering") return
     this.deferredChat = []
+    this.transferManager?.activate(false)
     this.update({
       status: "recovering",
       recoveryAttempt: 0,
@@ -1313,26 +1267,11 @@ export class PeerSession {
   private async refreshIce() {
     if (this.ice.expiresAt === null || this.ice.expiresAt > Date.now() + 30_000)
       return
-    if (this.state.signalingStatus !== "available")
-      throw new ConnectionError(
-        "signaling-unavailable",
-        "Signaling is needed to refresh relay credentials."
-      )
-    if (this.refresh) throw new Error("ICE refresh already in progress")
-    this.refreshId = crypto.randomUUID()
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.refresh = null
-        reject(
-          new ConnectionError(
-            "relay-unavailable",
-            "Relay credential refresh timed out."
-          )
-        )
-      }, 5_000)
-      this.refresh = { resolve, reject, timer }
-      this.sendSocket({ type: "ice-refresh", requestId: this.refreshId })
+    const generation = this.generation
+    const result = await this.api("session.turn", {
+      requestId: coordinationToken(),
     })
+    if (generation === this.generation) this.useIce(result.iceConfig)
   }
   private async restartTransport(forceReplacement = false) {
     if (this.recoveryBusy || this.state.recoveryAttempt >= 2) return
@@ -1345,6 +1284,7 @@ export class PeerSession {
         forceReplacement ||
         this.chat?.readyState !== "open" ||
         this.control?.readyState !== "open" ||
+        (this.files !== null && this.files.readyState !== "open") ||
         this.peer?.signalingState !== "stable"
       this.negotiation++
       this.transport = replace ? "replace" : "restart"
@@ -1370,6 +1310,7 @@ export class PeerSession {
     this.recoveryBusy = false
     this.channelReady = true
     this.update({ status: "connected", error: null, errorCode: null })
+    this.transferManager?.activate(true)
     this.startStats()
     const pending = this.deferredChat
     this.deferredChat = []
@@ -1424,6 +1365,10 @@ export class PeerSession {
     if (typeof message.id !== "string" || message.id.length > 64)
       throw new Error("Invalid message ID")
     if (channel === "control" && message.type === "chat.receipt") {
+      if (this.durable)
+        void this.localScope()
+          .then((scope) => content.receipt(scope, message.id))
+          .catch((error) => this.storageFailure(error))
       this.update({
         messages: this.state.messages.map((item) =>
           item.id === message.id && item.direction === "outgoing"
@@ -1441,6 +1386,53 @@ export class PeerSession {
       message.text.length > 4000
     )
       throw new Error("Invalid chat message")
+    if (this.durable) {
+      const generation = this.generation
+      const bytes = data.length * 2
+      if (this.applicationBytes + bytes > 64_000)
+        throw new Error("Local message write queue exceeded")
+      this.applicationBytes += bytes
+      this.applicationQueue = this.applicationQueue
+        .then(async () => {
+          if (generation !== this.generation) return
+          const scope = await this.localScope()
+          const incoming = {
+            id: message.id,
+            text: message.text,
+            direction: "incoming" as const,
+            status: "delivered" as const,
+            timestamp: Date.now(),
+          }
+          const saved = await content.saveMessage(scope, incoming)
+          if (generation !== this.generation) return
+          if (saved && !this.seenMessages.has(message.id)) {
+            this.seenMessages.add(message.id)
+            if (this.seenMessages.size > 2000)
+              this.seenMessages.delete(this.seenMessages.values().next().value!)
+            this.update({
+              messages: [
+                ...this.state.messages.filter(
+                  (item) =>
+                    !(item.id === message.id && item.direction === "incoming")
+                ),
+                incoming,
+              ].slice(-500),
+            })
+          }
+          if (
+            this.control?.readyState === "open" &&
+            this.control.bufferedAmount <= 64_000
+          )
+            this.control.send(
+              JSON.stringify({ v: 2, type: "chat.receipt", id: message.id })
+            )
+        })
+        .catch((error) => this.storageFailure(error))
+        .finally(() => {
+          this.applicationBytes -= bytes
+        })
+      return
+    }
     if (!this.seenMessages.has(message.id)) {
       this.seenMessages.add(message.id)
       if (this.seenMessages.size > 2000)
@@ -1475,6 +1467,7 @@ export class PeerSession {
       throw new Error(
         "The connection is busy. Wait a moment before sending again."
       )
+    if (this.durable) return this.sendStoredText(value)
     try {
       const id = crypto.randomUUID()
       this.chat!.send(
@@ -1500,6 +1493,53 @@ export class PeerSession {
     }
   }
 
+  private async sendStoredText(text: string) {
+    const generation = this.generation
+    const scope = await this.localScope()
+    const message = {
+      id: crypto.randomUUID(),
+      text,
+      direction: "outgoing" as const,
+      status: "sent" as const,
+      timestamp: Date.now(),
+    }
+    try {
+      await content.saveMessage(scope, message)
+    } catch (error) {
+      this.storageFailure(error)
+      throw error
+    }
+    if (
+      generation !== this.generation ||
+      this.state.status !== "connected" ||
+      this.chat?.readyState !== "open"
+    ) {
+      await content.saveMessage(scope, { ...message, status: "failed" })
+      throw new Error(
+        "Connection changed. Your message is saved locally but was not sent."
+      )
+    }
+    this.update({
+      messages: [...this.state.messages, message].slice(-500),
+      storageError: null,
+    })
+    try {
+      if (this.chat.bufferedAmount > 64_000)
+        throw new Error("The connection is busy. Your message was not sent.")
+      this.chat.send(
+        JSON.stringify({ v: 2, type: "chat.message", id: message.id, text })
+      )
+    } catch (error) {
+      await content.saveMessage(scope, { ...message, status: "failed" })
+      this.update({
+        messages: this.state.messages.map((item) =>
+          item.id === message.id ? { ...item, status: "failed" } : item
+        ),
+      })
+      throw error
+    }
+  }
+
   disconnect() {
     try {
       if (this.control?.readyState === "open")
@@ -1515,7 +1555,6 @@ export class PeerSession {
       expiresAt: null,
       error: null,
       errorCode: null,
-      messages: [],
     })
   }
   private fail(error: unknown, fallback: FailureCode = "protocol-error") {
@@ -1533,36 +1572,39 @@ export class PeerSession {
     })
   }
   dispose() {
+    this.statusAbort?.abort()
+    this.statusAbort = null
+    if (this.statusPoll) clearTimeout(this.statusPoll)
+    if (this.authorizationDeadline) clearTimeout(this.authorizationDeadline)
+    this.statusPoll = null
+    this.authorizationDeadline = null
+    this.apiAbort?.abort()
+    this.apiAbort = null
+    if (this.apiAuthorization && this.sessionId) {
+      // Best effort only; absolute expiry is the authoritative cleanup mechanism.
+      void coordinationRequest("session.close", {
+        sessionId: this.sessionId,
+        role: this.role,
+        authorization: this.apiAuthorization,
+      }).catch(() => {})
+    }
+    this.apiAuthorization = ""
+    this.transferManager?.dispose()
+    this.transferManager = null
+    this.scope = null
     this.generation++
-    this.socketGeneration++
+    this.nostr?.close()
+    this.nostr = null
+    this.nostrStarting = null
     if (this.deadline) clearTimeout(this.deadline)
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer)
     if (this.statsTimer) clearInterval(this.statsTimer)
-    this.clearSocketDeadline()
     this.deadline = null
-    this.reconnectTimer = null
     this.recoveryTimer = null
     this.statsTimer = null
-    if (this.refresh) {
-      clearTimeout(this.refresh.timer)
-      this.refresh.reject(new Error("Session ended"))
-      this.refresh = null
-    }
-    try {
-      if (this.socket?.readyState === WebSocket.OPEN)
-        this.sendSocket({ type: "leave" })
-      this.socket?.close()
-    } catch {
-      /* Teardown is best effort. */
-    }
-    this.socket = null
     this.closeTransport()
     this.cipher = null
     this.secret = ""
-    this.resumeTokens = []
-    this.resumeRequest = null
-    this.pendingSignals.clear()
     this.deferredChat = []
   }
 }
